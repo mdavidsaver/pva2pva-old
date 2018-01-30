@@ -1,0 +1,6 @@
+
+# from demo.cpp
+device(waveform, CONSTANT, devWfPDBDemo, "QSRV Demo")
+device(longout, CONSTANT, devLoPDBDemoTag, "QSRV Demo Tag")
+# from imagedemo.c
+function(QSRV_image_demo)

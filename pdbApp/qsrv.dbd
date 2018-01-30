@@ -5,10 +5,6 @@ registrar(QSRVRegistrar)
 #registrar(installPVAAddLinkHook)
 #link("pva", "lsetPVA")
 
-# from demo.cpp
-device(waveform, CONSTANT, devWfPDBDemo, "QSRV Demo")
-# from imagedemo.c
-function(QSRV_image_demo)
 # from pvif.cpp
 # Disable mapping of display.format
 variable(qsrvDisableFormat, int)

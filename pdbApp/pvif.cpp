@@ -12,6 +12,9 @@
 #include <errSymTbl.h>
 #include <epicsVersion.h>
 
+// stdout, stderr are redirected for capture by iocsh
+#include <epicsStdio.h>
+
 #include <pv/status.h>
 #include <pv/bitSet.h>
 #include <pv/pvData.h>
@@ -29,6 +32,8 @@
 #    define USE_INT64
 #  endif
 #endif
+
+#define USERTAG_CONST "usertag"
 
 extern "C" {
 int qsrvDisableFormat = 1;
@@ -77,14 +82,16 @@ struct pvTimeAlarm {
     dbChannel *chan;
 
     pvd::uint32 nsecMask;
+    dbInfoNode *utagNode;
 
     pvd::BitSet maskALWAYS, maskALARM;
 
     pvd::PVLongPtr sec;
-    pvd::PVIntPtr status, severity, nsec, userTag;
+    pvd::PVIntPtr status, severity, nsec, userTag32;
+    pvd::PVULongPtr userTag64;
     pvd::PVStringPtr message;
 
-    pvTimeAlarm() :chan(NULL), nsecMask(0) {}
+    pvTimeAlarm() :chan(NULL), nsecMask(0), utagNode(0) {}
 };
 
 struct pvCommon : public pvTimeAlarm {
@@ -261,14 +268,18 @@ void mapStatus(unsigned code, pvd::PVInt* status, pvd::PVString* message)
 
 
 template<typename META>
-void putMetaImpl(const pvTimeAlarm& pv, const META& meta)
+void putTimeImpl(const pvTimeAlarm& pv, const META& meta)
 {
     pvd::int32 nsec = meta.time.nsec;
-    if(pv.nsecMask) {
-        pv.userTag->put(nsec&pv.nsecMask);
+    if(pv.userTag32 && pv.nsecMask) {
+        pv.userTag32->put(nsec&pv.nsecMask);
         nsec &= ~pv.nsecMask;
+    } else if(pv.userTag64 && pv.utagNode) {
+        const pvd::uint64 *ptag = (const pvd::uint64*)pv.utagNode->pointer;
+        pv.userTag64->put(ptag ? *ptag : 0);
     }
-    pv.nsec->put(nsec);    pv.sec->put(meta.time.secPastEpoch+POSIX_TIME_AT_EPICS_EPOCH);
+    pv.nsec->put(nsec);
+    pv.sec->put(meta.time.secPastEpoch+POSIX_TIME_AT_EPICS_EPOCH);
 }
 
 void putTime(const pvTimeAlarm& pv, unsigned dbe, db_field_log *pfl)
@@ -280,7 +291,7 @@ void putTime(const pvTimeAlarm& pv, unsigned dbe, db_field_log *pfl)
     if(status)
         throw std::runtime_error("dbGet for meta fails");
 
-    putMetaImpl(pv, meta);
+    putTimeImpl(pv, meta);
     if(dbe&DBE_ALARM) {
         mapStatus(meta.status, pv.status.get(), pv.message.get());
         pv.severity->put(meta.severity);
@@ -420,7 +431,7 @@ void putMeta(const pvCommon& pv, unsigned dbe, db_field_log *pfl)
     if(status)
         throw std::runtime_error("dbGet for meta fails");
 
-    putMetaImpl(pv, meta);
+    putTimeImpl(pv, meta);
 #define FMAP(MNAME, FNAME) pv.MNAME->put(meta.FNAME)
     if(dbe&DBE_ALARM) {
         mapStatus(meta.status, pv.status.get(), pv.message.get());
@@ -521,29 +532,42 @@ void putAll(const PVC &pv, unsigned dbe, db_field_log *pfl)
     }
 }
 
-void findNSMask(pvTimeAlarm& pvmeta, dbChannel *chan, const epics::pvData::PVStructurePtr& pvalue)
+void findUserTag(pvTimeAlarm& pvmeta, dbChannel *chan, const epics::pvData::PVStructurePtr& pvalue)
 {
     pdbRecordIterator info(chan);
-    const char *UT = info.info("Q:time:tag");
-    if(UT && strncmp(UT, "nsec:lsb:", 9)==0) {
+    dbInfoNode *UTnode = info.infoNode("Q:time:tag");
+    const char *UT = UTnode ? UTnode->string : 0;
+    if(!UT) {
+        // no-op
+    } else if(strncmp(UT, "nsec:lsb:", 9)==0) {
         try{
             pvmeta.nsecMask = epics::pvData::castUnsafe<pvd::uint32>(std::string(&UT[9]));
         }catch(std::exception& e){
             pvmeta.nsecMask = 0;
             std::cerr<<dbChannelRecord(chan)->name<<" : Q:time:tag nsec:lsb: requires a number not '"<<UT[9]<<"'\n";
         }
-    }
-    if(pvmeta.nsecMask>0 && pvmeta.nsecMask<=32) {
-        pvmeta.userTag = pvalue->getSubField<pvd::PVInt>("timeStamp.userTag");
-        if(!pvmeta.userTag) {
-            pvmeta.nsecMask = 0; // struct doesn't have userTag
-        } else {
-            pvd::uint64 mask = (1<<pvmeta.nsecMask)-1;
-            pvmeta.nsecMask = mask;
-            pvmeta.maskALWAYS.set(pvmeta.userTag->getFieldOffset());
+        if(pvmeta.nsecMask>0 && pvmeta.nsecMask<=32) {
+            pvmeta.userTag32 = pvalue->getSubField<pvd::PVInt>("timeStamp.userTag");
+            if(!pvmeta.userTag32) {
+                pvmeta.nsecMask = 0; // struct doesn't have userTag
+            } else {
+                pvd::uint64 mask = (1<<pvmeta.nsecMask)-1;
+                pvmeta.nsecMask = mask;
+                pvmeta.maskALWAYS.set(pvmeta.userTag32->getFieldOffset());
+            }
         }
-    } else
-        pvmeta.nsecMask = 0;
+
+    } else if(strcmp(UT, USERTAG_CONST)==0) {
+
+        pvmeta.userTag64 = pvalue->getSubField<pvd::PVULong>("timeStamp.userTag");
+        if(pvmeta.userTag64) {
+            pvmeta.utagNode = UTnode;
+            pvmeta.maskALWAYS.set(pvmeta.userTag64->getFieldOffset());
+        }
+
+    } else {
+        fprintf(stderr, "%s: invalid info(Q:time:tag, \"%s\")\n", dbChannelRecord(chan)->name, UT);
+    }
 }
 
 template<typename PVX, typename META>
@@ -576,7 +600,7 @@ struct PVIFScalarNumeric : public PVIF
             pvmeta.maskVALUEPut.set(0);
             pvmeta.maskVALUEPut.set(bit);
         }
-        findNSMask(pvmeta, chan, pvalue);
+        findUserTag(pvmeta, chan, pvalue);
     }
     virtual ~PVIFScalarNumeric() {}
 
@@ -658,26 +682,67 @@ ScalarBuilder::dtype(dbChannel *channel)
     short dbr = dbChannelFinalFieldType(channel);
     const long maxelem = dbChannelFinalElements(channel);
     const pvd::ScalarType pvt = DBR2PVD(dbr);
+    pvd::ScalarType userTagType = pvd::pvInt;
 
     if(INVALID_DB_REQ(dbr))
         throw std::invalid_argument("DBF code out of range");
 
+    pvd::StandardFieldPtr std(pvd::getStandardField());
+    pvd::FieldBuilderPtr builder(pvd::getFieldCreate()->createFieldBuilder());
+
+    pdbRecordIterator infos(channel);
+    const char *UT = infos.info("Q:time:tag");
+
+    if(!UT) {
+        // no-op
+    } else if(strncmp(UT, "nsec:lsb:", 9)==0) {
+        // no-op
+    } else if( strcmp(UT, USERTAG_CONST)==0) {
+        userTagType = pvd::pvULong;
+    } else {
+        fprintf(stderr, "%s: invalid info(Q:time:tag, \"%s\")\n", dbChannelRecord(channel)->name, UT);
+    }
+
+    // NTEnum isn't defined for an array, so just fudge as a plain integer array
     if(maxelem!=1 && dbr==DBR_ENUM)
         dbr = DBF_SHORT;
 
-    if(dbr==DBR_ENUM)
-        return pvd::getStandardField()->enumerated("alarm,timeStamp");
+    if(dbr==DBR_ENUM) {
+        builder = builder->add("value", std->enumerated());
+    } else if(maxelem==1) {
+        builder = builder->add("value", pvt);
+    } else {
+        builder = builder->addArray("value", pvt);
+    }
 
-    std::string options;
-    if(dbr!=DBR_STRING)
-        options = "alarm,timeStamp,display,control,valueAlarm";
-    else
-        options = "alarm,timeStamp,display,control";
+    builder = builder->add("alarm", std->alarm());
 
-    if(maxelem==1)
-        return pvd::getStandardField()->scalar(pvt, options);
-    else
-        return pvd::getStandardField()->scalarArray(pvt, options);
+    builder = builder->addNestedStructure("timeStamp")
+                ->add("secondsPastEpoch", pvd::pvLong)
+                ->add("nanoseconds", pvd::pvInt) // why oh why is this signed...
+                ->add("userTag", userTagType)
+            ->endNested();
+
+    if(dbr!=DBR_ENUM) {
+        builder = builder->add("display", std->display());
+        builder = builder->add("control", std->control());
+        if(dbr!=DBR_STRING) {
+            builder = builder->addNestedStructure("valueAlarm")
+                        ->add("active", pvd::pvBoolean)
+                        ->add("lowAlarmLimit", pvt)
+                        ->add("lowWarningLimit", pvt)
+                        ->add("highWarningLimit", pvt)
+                        ->add("highAlarmLimit", pvt)
+                        ->add("lowAlarmSeverity", pvd::pvInt)
+                        ->add("lowWarningSeverity", pvd::pvInt)
+                        ->add("highWarningSeverity", pvd::pvInt)
+                        ->add("highAlarmSeverity", pvd::pvInt)
+                        ->add("hysteresis", pvt)
+                    ->endNested();
+        }
+    }
+
+    return builder->createStructure();
 }
 
 PVIF*
@@ -880,7 +945,7 @@ struct PVIFMeta : public PVIF
             throw std::logic_error("PVIFMeta attached type mis-match");
         meta.chan = channel;
         attachTime(meta, field);
-        findNSMask(meta, channel, field);
+        findUserTag(meta, channel, field);
         if(enclosing) {
             meta.maskALWAYS.clear();
             meta.maskALWAYS.set(enclosing->getFieldOffset());
@@ -925,7 +990,7 @@ struct MetaBuilder : public PVIFBuilder
 
     virtual epics::pvData::FieldBuilderPtr dtype(epics::pvData::FieldBuilderPtr& builder,
                                                  const std::string& fld,
-                                                 dbChannel *channel)
+                                                 dbChannel *channel) OVERRIDE FINAL
     {
         pvd::StandardFieldPtr std(pvd::getStandardField());
         if(fld.empty()) {
@@ -987,7 +1052,7 @@ struct ProcBuilder : public PVIFBuilder
 
     virtual epics::pvData::FieldBuilderPtr dtype(epics::pvData::FieldBuilderPtr& builder,
                                                  const std::string& fld,
-                                                 dbChannel *channel)
+                                                 dbChannel *channel) OVERRIDE FINAL
     {
         // invisible
         return builder;

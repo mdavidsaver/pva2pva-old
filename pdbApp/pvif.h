@@ -134,6 +134,12 @@ struct pdbRecordIterator {
     const char *name() const {
         return m_done ? NULL : ((dbCommon*)ent.precnode->precord)->name;
     }
+    dbInfoNode *infoNode(const char *key)
+    {
+        if(m_done || dbFindInfo(&ent, key))
+            return 0;
+        return ent.pinfonode;
+    }
     const char *info(const char *key, const char *def =0)
     {
         if(m_done || dbFindInfo(&ent, key))
