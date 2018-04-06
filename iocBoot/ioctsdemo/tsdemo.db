@@ -1,0 +1,15 @@
+
+# when scanned, splits off the lower 16 bits as userTag.
+# try a 'pvget -v ts16' then print nanoseconds and userTag in hex
+record(ai, "ts16") {
+    field(VAL , "0")
+    field(SCAN, "1 second")
+    info(Q:time:tag, "nsec:lsb:16")
+}
+
+# Device support repeats the 32-bit value written stores as userTag.
+#  eg.  userTag = (value << 32) | value
+record(longout, "ts64") {
+    field(DTYP, "QSRV Demo Tag")
+    info(Q:time:tag, "usertag")
+}
