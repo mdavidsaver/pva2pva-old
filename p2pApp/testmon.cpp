@@ -8,6 +8,9 @@
 #include <pv/monitor.h>
 #include <pv/thread.h>
 #include <pv/serverContext.h>
+#include <pva/server.h>
+#include <pva/sharedstate.h>
+#include <pva/client.h>
 
 #include "server.h"
 
@@ -20,82 +23,111 @@ typedef epicsGuard<epicsMutex> Guard;
 
 namespace {
 
-pvd::PVStructurePtr makeRequest(size_t bsize)
+pvd::PVStructurePtr makeRequest(size_t bsize, bool pipeline=false)
 {
     pvd::StructureConstPtr dtype(pvd::getFieldCreate()->createFieldBuilder()
                                  ->addNestedStructure("record")
                                     ->addNestedStructure("_options")
                                         ->add("queueSize", pvd::pvString) // yes, really.  PVA wants a string
+                                        ->add("pipeline", pvd::pvBoolean)
                                     ->endNested()
                                  ->endNested()
                                  ->createStructure());
 
     pvd::PVStructurePtr ret(pvd::getPVDataCreate()->createPVStructure(dtype));
     ret->getSubFieldT<pvd::PVScalar>("record._options.queueSize")->putFrom<pvd::int32>(bsize);
+    ret->getSubFieldT<pvd::PVBoolean>("record._options.pipeline")->put(pipeline);
 
     return ret;
 }
 
+struct XYRecord
+{
+    static const pvd::StructureConstPtr type;
+
+    pvas::SharedPV::shared_pointer pv;
+
+    pvd::int32 x, y;
+
+    XYRecord()
+        :pv(pvas::SharedPV::buildMailbox())
+        ,x(0)
+        ,y(0)
+    {
+        pv->open(type);
+    }
+    ~XYRecord()
+    {
+        pv->close(true);
+    }
+
+    void post(bool px, bool py)
+    {
+        pvd::PVStructurePtr val(type->build());
+        pvd::BitSet changed;
+        if(px) {
+            pvd::PVScalarPtr fld(val->getSubFieldT<pvd::PVScalar>("x"));
+            fld->putFrom(x);
+            changed.set(fld->getFieldOffset());
+        }
+        if(py) {
+            pvd::PVScalarPtr fld(val->getSubFieldT<pvd::PVScalar>("y"));
+            fld->putFrom(y);
+            changed.set(fld->getFieldOffset());
+        }
+        pv->post(*val, changed);
+    }
+};
+
+const pvd::StructureConstPtr XYRecord::type(pvd::FieldBuilder::begin()
+                                            ->add("x", pvd::pvInt)
+                                            ->add("y", pvd::pvInt)
+                                            ->createStructure());
+
 struct TestMonitor {
-    TestProvider::shared_pointer upstream;
-    TestPV::shared_pointer test1;
-    ScalarAccessor<pvd::int32> test1_x, test1_y;
+    pvas::StaticProvider upstream;
+    XYRecord test1;
 
     GWServerChannelProvider::shared_pointer gateway;
 
-    TestChannelRequester::shared_pointer client_req;
-    pva::Channel::shared_pointer client;
+    pvac::ClientProvider client;
+    pvac::ClientChannel chan;
 
     // prepare providers and connect the client channel, don't setup monitor
     TestMonitor()
-        :upstream(new TestProvider())
-        ,test1(upstream->addPV("test1", pvd::getFieldCreate()->createFieldBuilder()
-                               ->add("x", pvd::pvInt)
-                               ->add("y", pvd::pvInt)
-                               ->createStructure()))
-        ,test1_x(test1->value, "x")
-        ,test1_y(test1->value, "y")
-        ,gateway(new GWServerChannelProvider(upstream))
-        ,client_req(new TestChannelRequester)
-        ,client(gateway->createChannel("test1", client_req))
+        :upstream("upstream")
+        ,gateway(new GWServerChannelProvider(upstream.provider()))
+        ,client(gateway)
     {
         testDiag("pre-test setup");
-        if(!client)
-            testAbort("channel \"test1\" not connected");
-        test1_x = 1;
-        test1_y = 2;
+        upstream.add("test1", test1.pv);
+
+        test1.x = 1;
+        test1.y = 2;
+        test1.post(true, true);
+
+        chan = client.connect("test1");
     }
 
-    ~TestMonitor()
-    {
-        client->destroy();
-        gateway->destroy(); // noop atm.
-    }
+    ~TestMonitor() {}
 
     void test_event()
     {
         testDiag("Push the initial event through from upstream to downstream");
 
-        TestChannelMonitorRequester::shared_pointer mreq(new TestChannelMonitorRequester);
-        pvd::Monitor::shared_pointer mon(client->createMonitor(mreq, makeRequest(2)));
-        if(!mon) testAbort("Failed to create monitor");
+        pvac::MonitorSync mon(chan.monitor(makeRequest(2)));
 
-        testEqual(mreq->eventCnt, 0u);
-        testOk1(mon->start().isSuccess());
-        upstream->dispatch(); // trigger monitorEvent() from upstream to gateway
+        testOk1(mon.wait(1.0));
+        testOk1(mon.poll());
 
-        testEqual(mreq->eventCnt, 1u);
-        pva::MonitorElementPtr elem(mon->poll());
-        testOk1(!!elem.get());
-        if(!!elem.get()) testEqual(toString(*elem->changedBitSet), "{0}");
-        else testFail("oops");
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==1);
+        testFieldEqual<pvd::PVInt>(mon.root, "x", 1);
+        testFieldEqual<pvd::PVInt>(mon.root, "y", 2);
+        testEqual(mon.changed, pvd::BitSet().set(0));
+        testEqual(mon.overrun, pvd::BitSet());
 
-        if(elem) mon->release(elem);
-
-        testOk1(!mon->poll());
-
-        mon->destroy();
+        testOk1(!mon.poll());
+        testOk1(!mon.wait(0.1)); // timeout
+        testOk1(!mon.poll());
     }
 
     void test_share()
@@ -105,250 +137,107 @@ struct TestMonitor {
         // but w/ TestProvider makes no difference
         testDiag("Test two downstream monitors sharing the same upstream");
 
-        TestChannelMonitorRequester::shared_pointer mreq(new TestChannelMonitorRequester);
-        pvd::Monitor::shared_pointer mon(client->createMonitor(mreq, makeRequest(2)));
-        if(!mon) testAbort("Failed to create monitor");
+        pvac::MonitorSync mon(chan.monitor(makeRequest(2)));
+        pvac::MonitorSync mon2(chan.monitor(makeRequest(2)));
+
+        testOk1(mon.wait(1.0));
+        testOk1(mon2.wait(1.0));
+        testOk1(mon.poll());
+        testOk1(mon2.poll());
+
+        testFieldEqual<pvd::PVInt>(mon.root, "x", 1);
+        testFieldEqual<pvd::PVInt>(mon.root, "y", 2);
+        testEqual(mon.changed, pvd::BitSet().set(0));
+        testEqual(mon.overrun, pvd::BitSet());
+
+        testFieldEqual<pvd::PVInt>(mon2.root, "x", 1);
+        testFieldEqual<pvd::PVInt>(mon2.root, "y", 2);
+        testEqual(mon2.changed, pvd::BitSet().set(0));
+        testEqual(mon2.overrun, pvd::BitSet());
 
 
-        TestChannelMonitorRequester::shared_pointer mreq2(new TestChannelMonitorRequester);
-        pvd::Monitor::shared_pointer mon2(client->createMonitor(mreq2, makeRequest(2)));
-        if(!mon2) testAbort("Failed to create monitor2");
-
-        testOk1(mreq->eventCnt==0);
-        testOk1(mreq2->eventCnt==0);
-        testOk1(mon->start().isSuccess());
-        testOk1(mon2->start().isSuccess());
-        upstream->dispatch(); // trigger monitorEvent() from upstream to gateway
-
-        testOk1(mreq->eventCnt==1);
-        testOk1(mreq2->eventCnt==1);
-
-        pva::MonitorElementPtr elem(mon->poll());
-        pva::MonitorElementPtr elem2(mon2->poll());
-        testOk1(!!elem.get());
-        testOk1(!!elem2.get());
-        testOk1(elem!=elem2);
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==1);
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("y")->get()==2);
-        testOk1(elem2 && elem2->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==1);
-        testOk1(elem2 && elem2->pvStructurePtr->getSubFieldT<pvd::PVInt>("y")->get()==2);
-
-        if(elem) mon->release(elem);
-        if(elem2) mon2->release(elem2);
-
-        testOk1(!mon->poll());
-        testOk1(!mon2->poll());
+        testOk1(!mon.wait(0.1)); // timeout
+        testOk1(!mon.poll());
+        testOk1(!mon2.poll());
 
         testDiag("explicitly push an update");
-        test1_x = 42;
-        test1_y = 43;
-        pvd::BitSet changed;
-        changed.set(1); // only indicate that 'x' changed
-        test1->post(changed);
+        test1.x = 42;
+        test1.y = 43;
+        test1.post(true, false); // only indicate that 'x' changed
 
-        elem = mon->poll();
-        elem2 = mon2->poll();
-        testOk1(!!elem.get());
-        testOk1(!!elem2.get());
-        testOk1(elem!=elem2);
-        if(elem) testDiag("elem changed '%s' overflow '%s'", toString(*elem->changedBitSet).c_str(), toString(*elem->overrunBitSet).c_str());
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==42);
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("y")->get()==2);
-        if(elem2) testDiag("elem2 changed '%s' overflow '%s'", toString(*elem2->changedBitSet).c_str(), toString(*elem2->overrunBitSet).c_str());
-        testOk1(elem2 && elem2->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==42);
-        testOk1(elem2 && elem2->pvStructurePtr->getSubFieldT<pvd::PVInt>("y")->get()==2);
+        testOk1(mon.wait(1.0));
+        testOk1(mon2.wait(1.0));
+        testOk1(mon.poll());
+        testOk1(mon2.poll());
 
-        if(elem) mon->release(elem);
-        if(elem2) mon2->release(elem2);
+        testFieldEqual<pvd::PVInt>(mon.root, "x", 42);
+        testFieldEqual<pvd::PVInt>(mon.root, "y", 2);
+        testEqual(mon.changed, pvd::BitSet().set(1));
+        testEqual(mon.overrun, pvd::BitSet());
 
-        testOk1(!mon->poll());
-        testOk1(!mon2->poll());
+        testFieldEqual<pvd::PVInt>(mon2.root, "x", 42);
+        testFieldEqual<pvd::PVInt>(mon2.root, "y", 2);
+        testEqual(mon2.changed, pvd::BitSet().set(1));
+        testEqual(mon2.overrun, pvd::BitSet());
 
-        mon->destroy();
-        mon2->destroy();
-    }
+        testOk1(!mon.poll());
+        testOk1(!mon2.poll());
 
-    void test_ds_no_start()
-    {
-        testDiag("Test downstream monitor never start()s");
-
-        TestChannelMonitorRequester::shared_pointer mreq(new TestChannelMonitorRequester);
-        pvd::Monitor::shared_pointer mon(client->createMonitor(mreq, makeRequest(2)));
-        if(!mon) testAbort("Failed to create monitor");
-
-        upstream->dispatch(); // trigger monitorEvent() from upstream to gateway
-
-        testOk1(mreq->eventCnt==0);
-        testOk1(!mon->poll());
-
-        pvd::BitSet changed;
-        changed.set(1);
-        test1_x=50;
-        test1->post(changed, false);
-        test1_x=51;
-        test1->post(changed, false);
-        test1_x=52;
-        test1->post(changed, false);
-        test1_x=53;
-        test1->post(changed);
-
-        testOk1(!mon->poll());
-
-        mon->destroy();
-    }
-
-    void test_overflow_upstream()
-    {
-        testDiag("Check behavour when upstream monitor overflows (mostly transparent)");
-
-        TestChannelMonitorRequester::shared_pointer mreq(new TestChannelMonitorRequester);
-        pvd::Monitor::shared_pointer mon(client->createMonitor(mreq, makeRequest(2)));
-        if(!mon) testAbort("Failed to create monitor");
-
-        testOk1(mreq->eventCnt==0);
-        testOk1(mon->start().isSuccess());
-        upstream->dispatch(); // trigger monitorEvent() from upstream to gateway
-        testOk1(mreq->eventCnt==1);
-
-        testDiag("poll initial update");
-        pva::MonitorElementPtr elem(mon->poll());
-        testOk1(!!elem.get());
-        if(elem) mon->release(elem);
-
-        testOk1(!mon->poll());
-
-        // queue 4 events input buffer of size 2
-        // don't notify downstream until after overflow has occurred
-        pvd::BitSet changed;
-        changed.set(1);
-        test1_x=50;
-        testDiag("post 50");
-        test1->post(changed, false);
-        test1_x=51;
-        testDiag("post 51");
-        test1->post(changed, false);
-        test1_x=52;
-        testDiag("post 52");
-        test1->post(changed, false);
-        test1_x=53;
-        testDiag("post 53");
-        test1->post(changed);
-
-        elem = mon->poll();
-        testOk1(!!elem.get());
-
-        testDiag("XX %d", elem ? elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get() : -42);
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==50);
-        testOk1(elem && elem->changedBitSet->nextSetBit(0)==1);
-        testOk1(elem && elem->changedBitSet->nextSetBit(2)==-1);
-        testOk1(elem && elem->overrunBitSet->nextSetBit(0)==-1);
-
-        if(elem) mon->release(elem);
-
-        elem = mon->poll();
-        testOk1(!!elem.get());
-
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==51);
-        testOk1(elem && elem->changedBitSet->nextSetBit(0)==1);
-        testOk1(elem && elem->changedBitSet->nextSetBit(2)==-1);
-        testOk1(elem && elem->overrunBitSet->nextSetBit(0)==-1);
-
-        if(elem) mon->release(elem);
-
-        elem = mon->poll();
-        testOk1(!!elem.get());
-
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==53);
-        testOk1(elem && elem->changedBitSet->nextSetBit(0)==1);
-        testOk1(elem && elem->changedBitSet->nextSetBit(2)==-1);
-        testOk1(elem && elem->overrunBitSet->nextSetBit(0)==1);
-        testOk1(elem && elem->overrunBitSet->nextSetBit(2)==-1);
-
-        if(elem) mon->release(elem);
-
-        testOk1(!mon->poll());
-
-        mon->destroy();
+        testOk1(!mon.wait(0.1)); // timeout
+        testOk1(!mon.poll());
+        testOk1(!mon2.poll());
     }
 
     void test_overflow_downstream()
     {
         testDiag("Check behavour when downstream monitor overflows");
 
-        TestChannelMonitorRequester::shared_pointer mreq(new TestChannelMonitorRequester);
-        pvd::Monitor::shared_pointer mon(client->createMonitor(mreq, makeRequest(2)));
-        if(!mon) testAbort("Failed to create monitor");
+        pvac::MonitorSync mon(chan.monitor(makeRequest(3)));
 
-        testOk1(mreq->eventCnt==0);
-        testOk1(mon->start().isSuccess());
-        upstream->dispatch(); // trigger monitorEvent() from upstream to gateway
-        testOk1(mreq->eventCnt==1);
+        testOk1(mon.wait(1.0));
+        testOk1(mon.poll());
 
-        testDiag("poll initial update");
-        pva::MonitorElementPtr elem(mon->poll());
-        testOk1(!!elem.get());
-        if(elem) mon->release(elem);
+        test1.x = 50;
+        test1.post(true, false);
+        test1.x = 51;
+        test1.post(true, false);
+        test1.x = 52;
+        test1.post(true, false);
+        test1.x = 53;
+        test1.post(true, false);
 
-        // queue 4 events into buffer of size 2 (plus the overflow element)
-        // notify downstream after each update
-        // so the upstream queue never overflows
-        pvd::BitSet changed;
-        changed.set(1);
-        test1_x=50;
-        test1->post(changed);
-        test1_x=51;
-        test1->post(changed);
-        test1_x=52;
-        test1->post(changed);
-        test1_x=53;
-        test1->post(changed);
+        testOk1(mon.wait(1.0));
+        testOk1(mon.poll());
+        testFieldEqual<pvd::PVInt>(mon.root, "x", 50);
+        testFieldEqual<pvd::PVInt>(mon.root, "y", 2);
+        testEqual(mon.changed, pvd::BitSet().set(1));
+        testEqual(mon.overrun, pvd::BitSet());
 
-        elem = mon->poll();
-        testOk1(!!elem.get());
+        testOk1(mon.poll());
+        testFieldEqual<pvd::PVInt>(mon.root, "x", 51);
+        testFieldEqual<pvd::PVInt>(mon.root, "y", 2);
+        testEqual(mon.changed, pvd::BitSet().set(1));
+        testEqual(mon.overrun, pvd::BitSet());
 
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==50);
-        testOk1(elem && elem->changedBitSet->nextSetBit(0)==1);
-        testOk1(elem && elem->changedBitSet->nextSetBit(2)==-1);
-        testOk1(elem && elem->overrunBitSet->nextSetBit(0)==-1);
+        testOk1(mon.poll());
+        testFieldEqual<pvd::PVInt>(mon.root, "x", 53);
+        testFieldEqual<pvd::PVInt>(mon.root, "y", 2);
+        testEqual(mon.changed, pvd::BitSet().set(1));
+        testEqual(mon.overrun, pvd::BitSet().set(1));
 
-        if(elem) mon->release(elem);
+        testOk1(!mon.poll());
 
-        elem = mon->poll();
-        testOk1(!!elem.get());
-
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==51);
-        testOk1(elem && elem->changedBitSet->nextSetBit(0)==1);
-        testOk1(elem && elem->changedBitSet->nextSetBit(2)==-1);
-        testOk1(elem && elem->overrunBitSet->nextSetBit(0)==-1);
-
-        if(elem) mon->release(elem);
-
-        elem = mon->poll();
-        testOk1(!!elem.get());
-
-        testOk1(elem && elem->pvStructurePtr->getSubFieldT<pvd::PVInt>("x")->get()==53);
-        testOk1(elem && elem->changedBitSet->nextSetBit(0)==1);
-        testOk1(elem && elem->changedBitSet->nextSetBit(2)==-1);
-        testOk1(elem && elem->overrunBitSet->nextSetBit(0)==1);
-        testOk1(elem && elem->overrunBitSet->nextSetBit(2)==-1);
-
-        if(elem) mon->release(elem);
-
-        testOk1(!mon->poll());
-
-        mon->destroy();
+        testOk1(!mon.wait(0.1)); // timeout
+        testOk1(!mon.poll());
     }
 };
-
 } // namespace
 
 MAIN(testmon)
 {
-    testPlan(79);
+    testPlan(64);
     TEST_METHOD(TestMonitor, test_event);
     TEST_METHOD(TestMonitor, test_share);
-    TEST_METHOD(TestMonitor, test_ds_no_start);
-    TEST_METHOD(TestMonitor, test_overflow_upstream);
     TEST_METHOD(TestMonitor, test_overflow_downstream);
     TestProvider::testCounts();
     int ok = 1;
