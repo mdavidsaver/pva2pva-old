@@ -65,20 +65,26 @@ MonitorCacheEntry::monitorConnect(pvd::Status const & status,
             // we shouldn't have to deal with monitor type change since we
             // destroy() Monitors on Channel disconnect.
             std::cerr<<"monitorConnect() w/ new type.  Monitor has outlived it's connection.\n";
+            UnGuard U(G);
             monitor->stop();
             //TODO: unlisten()
             return;
         }
         typedesc = structure;
 
-        if(status.isSuccess()) {
-            startresult = monitor->start();
-        } else {
-            startresult = status;
-        }
-
         if(startresult.isSuccess()) {
             lastelem.reset(new pvd::MonitorElement(pvd::getPVDataCreate()->createPVStructure(structure)));
+        }
+
+        if(status.isSuccess()) {
+            pvd::Status rs;
+            {
+                UnGuard U(G);
+                rs = monitor->start();
+            }
+            startresult = rs;
+        } else {
+            startresult = status;
         }
 
         // set typedesc and startresult for futured MonitorUsers
