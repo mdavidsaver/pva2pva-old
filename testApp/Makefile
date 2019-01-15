@@ -18,7 +18,6 @@ TARGETS += $(COMMON_DIR)/pvaLinkTestIoc.dbd
 pvaLinkTestIoc_DBD += base.dbd
 pvaLinkTestIoc_DBD += qsrv.dbd
 
-PROD_SRCS += utilitiesx.cpp
 PROD_LIBS += pvAccess pvData
 PROD_LIBS += $(EPICS_BASE_IOC_LIBS)
 
@@ -26,10 +25,6 @@ TESTPROD_HOST += testweak
 testweak_SRCS += testweak.cpp
 testweak_LIBS += Com
 TESTS += testweak
-
-TESTPROD_HOST += testtest
-testtest_SRCS += testtest.cpp
-TESTS += testtest
 
 
 TESTPROD_HOST += testpvif

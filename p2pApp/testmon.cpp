@@ -134,7 +134,7 @@ struct TestMonitor {
     {
         // here both downstream monitors are on the same Channel,
         // which would be inefficient, and slightly unrealistic, w/ real PVA,
-        // but w/ TestProvider makes no difference
+        // but w/ SharedPV makes no difference
         testDiag("Test two downstream monitors sharing the same upstream");
 
         pvac::MonitorSync mon(chan.monitor(makeRequest(2)));
@@ -235,11 +235,10 @@ struct TestMonitor {
 
 MAIN(testmon)
 {
-    testPlan(64);
+    testPlan(63);
     TEST_METHOD(TestMonitor, test_event);
     TEST_METHOD(TestMonitor, test_share);
     TEST_METHOD(TestMonitor, test_overflow_downstream);
-    TestProvider::testCounts();
     int ok = 1;
     size_t temp;
 #define TESTC(name) temp=epicsAtomicGetSizeT(&name::num_instances); ok &= temp==0; testDiag("num. live "  #name " %u", (unsigned)temp)
