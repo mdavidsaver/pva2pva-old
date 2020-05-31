@@ -48,6 +48,32 @@ void QSRVRegistrar_counters()
 
 namespace {
 
+void dbLoadGroup(const char* fname)
+{
+    try {
+        if(!fname) {
+            printf("dbLoadGroup(\"file.json\")\n"
+                   "\n"
+                   "Load additional DB group definitions from file.\n");
+            return;
+        }
+
+        if(fname[0]=='-') {
+            fname++;
+            if(fname[0]=='*' && fname[1]=='\0') {
+                PDBProvider::group_files.clear();
+            } else {
+                PDBProvider::group_files.remove(fname);
+            }
+        } else {
+            PDBProvider::group_files.push_back(fname);
+        }
+
+    }catch(std::exception& e){
+        fprintf(stderr, "Error: %s\n", e.what());
+    }
+}
+
 void dbgl(int lvl, const char *pattern)
 {
     if(!pattern)
@@ -88,6 +114,7 @@ void QSRVRegistrar()
     QSRVRegistrar_counters();
     pva::ChannelProviderRegistry::servers()->addSingleton<PDBProvider>("QSRV");
     epics::iocshRegister<int, const char*, &dbgl>("dbgl", "level", "pattern");
+    epics::iocshRegister<const char*, &dbLoadGroup>("dbLoadGroup", "jsonfile");
 }
 
 } // namespace
