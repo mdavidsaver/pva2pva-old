@@ -32,6 +32,7 @@
 #include <epicsExport.h>
 
 extern "C" {
+const VFieldType vfStructure = {"epics::pvData::StructureConstPtr"};
 const VFieldType vfPVStructure = {"epics::pvData::PVStructurePtr"};
 }
 
@@ -40,12 +41,14 @@ namespace  {
 namespace pvd = epics::pvData;
 
 ELLLIST vfPVStructureList = ELLLIST_INIT;
-VFieldTypeNode vfPVStructureNode;
+VFieldTypeNode vfPVStructureNode[2];
 
 long initialize()
 {
-    vfPVStructureNode.vtype = &vfPVStructure;
-    ellAdd(&vfPVStructureList, &vfPVStructureNode.node);
+    vfPVStructureNode[0].vtype = &vfStructure;
+    ellAdd(&vfPVStructureList, &vfPVStructureNode[0].node);
+    vfPVStructureNode[1].vtype = &vfPVStructure;
+    ellAdd(&vfPVStructureList, &vfPVStructureNode[1].node);
     return 0;
 }
 
@@ -182,11 +185,23 @@ long get_vfield(struct dbAddr *paddr, struct VField *p)
 {
     pvstructinRecord *prec = (pvstructinRecord*)paddr->precord;
 
+    if(!prec->ptyp)
+        return S_db_notInit;
+
     if(p->vtype==&vfPVStructure) {
         VSharedPVStructure *pstr = (VSharedPVStructure*)p;
         if(dbGetFieldIndex(paddr)==pvstructinRecordVAL) {
+            if(!*pstr->value)
+                return S_db_notInit;
             (*pstr->value)->copy(*prec->val);
             *pstr->changed = prec->chg;
+            return 0;
+        }
+
+    } else if(p->vtype==&vfStructure) {
+        VSharedStructure *pstr = (VSharedStructure*)p;
+        if(dbGetFieldIndex(paddr)==pvstructinRecordVAL) {
+            *pstr->value = prec->ptyp;
             return 0;
         }
     }
@@ -196,6 +211,9 @@ long get_vfield(struct dbAddr *paddr, struct VField *p)
 long put_vfield(struct dbAddr *paddr, const struct VField *p)
 {
     pvstructinRecord *prec = (pvstructinRecord*)paddr->precord;
+
+    if(!prec->ptyp)
+        return S_db_notInit;
 
     if(p->vtype==&vfPVStructure) {
         const VSharedPVStructure *pstr = (const VSharedPVStructure*)p;

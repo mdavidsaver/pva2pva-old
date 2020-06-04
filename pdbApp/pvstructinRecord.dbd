@@ -18,6 +18,11 @@ recordtype(pvstructin) {
     %#ifdef __cplusplus
     %extern "C" {
     %#endif
+    %QSRV_API extern const VFieldType vfStructure;
+    %struct VSharedStructure {
+    %    const VFieldType* vtype;
+    %    epics::pvData::StructureConstPtr* value;
+    %};
     %QSRV_API extern const VFieldType vfPVStructure;
     %struct VSharedPVStructure {
     %    const VFieldType* vtype;
