@@ -1072,7 +1072,7 @@ struct Arbitrary : public PVIF
 
 struct ArbitraryBuilder : public PVIFBuilder
 {
-    epics::pvData::FieldConstPtr type;
+    epics::pvData::StructureConstPtr type;
 
     ArbitraryBuilder(dbChannel* chan)
         :PVIFBuilder(chan)
@@ -1080,21 +1080,14 @@ struct ArbitraryBuilder : public PVIFBuilder
         if(!channel)
             throw std::runtime_error("+type:\"arbitrary\" requires +channel:");
 
-        pvd::PVStructurePtr val;
         pvd::BitSet changed;
-        VSharedPVStructure arg;
-        arg.vtype = &vfPVStructure;
-        arg.value = &val;
-        arg.changed = &changed;
+        VSharedStructure arg;
+        arg.vtype = &vfStructure;
+        arg.value = &type;
 
         long status = dbChannelGet(chan, DBR_VFIELD, &arg, NULL, NULL, NULL);
-        if(status || !val)
+        if(status || !type)
             throw std::runtime_error("arbitrary mapping unable to fetch initial value/type");
-
-        type = val->getStructure();
-
-        if(type->getType()!=pvd::structure)
-            throw std::runtime_error("arbitrary mapping requires Structure (not entirely arbitrary)");
     }
     virtual ~ArbitraryBuilder() {}
 
