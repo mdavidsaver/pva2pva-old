@@ -390,26 +390,27 @@ private:
  * Caller than creates a PVStructure and uses PVIFBuilder::attach() to
  * build mappings for each dbChannel in the composed locations.
  */
-struct QSRV_API PVIFBuilder {
+struct QSRV_API PVIFBuilder
+{
+    dbChannel* const channel;
 
     virtual ~PVIFBuilder() {}
 
     // fetch the structure description
-    virtual epics::pvData::FieldConstPtr dtype(dbChannel *channel) =0;
+    virtual epics::pvData::FieldConstPtr dtype() =0;
 
     virtual epics::pvData::FieldBuilderPtr dtype(epics::pvData::FieldBuilderPtr& builder,
-                                                 const std::string& fld,
-                                                 dbChannel *channel);
+                                                 const std::string& fld);
 
     // Attach to a structure instance.
     // must be of the type returned by dtype().
     // must be the root structure
-    virtual PVIF* attach(dbChannel *channel, const epics::pvData::PVStructurePtr& root, const FieldName& fld) =0;
+    virtual PVIF* attach(const epics::pvData::PVStructurePtr& root, const FieldName& fld) =0;
 
     // entry point for Builder
-    static PVIFBuilder* create(const std::string& name);
+    static PVIFBuilder* create(const std::string& mapname, dbChannel* chan);
 protected:
-    PVIFBuilder() {}
+    explicit PVIFBuilder(dbChannel* chan) : channel(chan) {}
 private:
     PVIFBuilder(const PVIFBuilder&);
     PVIFBuilder& operator=(const PVIFBuilder&);
@@ -417,10 +418,14 @@ private:
 
 struct QSRV_API ScalarBuilder : public PVIFBuilder
 {
-    virtual ~ScalarBuilder() {}
+    explicit ScalarBuilder(dbChannel* chan, const VFieldType* vtype=0);
+    virtual ~ScalarBuilder();
 
-    virtual epics::pvData::FieldConstPtr dtype(dbChannel *channel) OVERRIDE FINAL;
-    virtual PVIF* attach(dbChannel *channel, const epics::pvData::PVStructurePtr& root, const FieldName& fld) OVERRIDE FINAL;
+    virtual epics::pvData::FieldConstPtr dtype() OVERRIDE FINAL;
+    virtual PVIF* attach(const epics::pvData::PVStructurePtr& root, const FieldName& fld) OVERRIDE FINAL;
+
+    const VFieldType* vtype;
+    const bool scalar;
 };
 
 
